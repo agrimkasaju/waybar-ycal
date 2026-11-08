@@ -1,6 +1,22 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
+import os
+import sys
 from ctypes import CDLL
-CDLL('libgtk4-layer-shell.so')
+
+local_lib = os.path.expanduser('~/.local/usr/lib/x86_64-linux-gnu')
+local_typelib = os.path.join(local_lib, 'girepository-1.0')
+if os.path.exists(local_typelib):
+    current = os.environ.get('GI_TYPELIB_PATH', '')
+    os.environ['GI_TYPELIB_PATH'] = f"{local_typelib}:{current}" if current else local_typelib
+
+try:
+    CDLL('libgtk4-layer-shell.so')
+except OSError:
+    try:
+        CDLL(os.path.join(local_lib, 'libgtk4-layer-shell.so'))
+    except OSError:
+        CDLL('libgtk4-layer-shell.so.0')
+
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gtk4LayerShell", "1.0")
@@ -18,10 +34,13 @@ import threading
 import tomllib
 
 CACHE_FILE = os.path.expanduser('~/.cache/waybar-ycal/events.json')
+ACCOUNT_FILE = os.path.expanduser('~/.cache/waybar-ycal/account.txt')
 PID_FILE = os.path.expanduser('~/.cache/waybar-ycal/popup.pid')
 THEME_FILE = os.path.expanduser('~/.config/omarchy/current/theme/colors.toml')
 CREDENTIALS_FILE = os.path.expanduser('~/.config/waybar-ycal/credentials.json')
 TOKEN_FILE = os.path.expanduser('~/.cache/waybar-ycal/token.json')
+NOTIFICATIONS_FILE = os.path.expanduser('~/.cache/waybar-ycal/notifications.json')
+ANUBIS_NOTIFICATIONS_FILE = os.path.expanduser('~/Downloads/Anubis/config/scheduled_reminders.json')
 SYNC_INTERVAL_SEC = 15 * 60  # 15 minutes
 
 # Nerd Font family used for icon buttons (refresh + edit).
@@ -75,6 +94,14 @@ def _run_sync():
 
         # Fetch from all calendars
         cal_list = service.calendarList().list().execute()
+        for c in cal_list.get('items', []):
+            if c.get('primary'):
+                try:
+                    with open(ACCOUNT_FILE, 'w') as f:
+                        f.write(c.get('id', ''))
+                except Exception:
+                    pass
+                break
         calendar_ids = [c['id'] for c in cal_list.get('items', [])]
 
         events_by_date = {}
@@ -171,14 +198,96 @@ def hex_to_rgba(hex_color, alpha):
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return f'rgba({r}, {g}, {b}, {alpha})'
 
+def load_local_notifications():
+    """Loads scheduled local notifications/reminders mapped by date."""
+    notifs_by_date = {}
+    sources = [NOTIFICATIONS_FILE, ANUBIS_NOTIFICATIONS_FILE]
+    seen_ids = set()
+    for s_path in sources:
+        if os.path.exists(s_path):
+            try:
+                with open(s_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for item in data:
+                            nid = item.get('id') or item.get('unit')
+                            if nid and nid in seen_ids:
+                                continue
+                            if nid:
+                                seen_ids.add(nid)
+                            
+                            dt_str = item.get('target_dt')
+                            time_label = item.get('time', '')
+                            date_key = item.get('date', '')
+                            if dt_str:
+                                try:
+                                    date_key = dt_str[:10]
+                                    dt = datetime.datetime.fromisoformat(dt_str)
+                                    time_label = dt.strftime('%I:%M %p')
+                                except Exception:
+                                    pass
+
+                            if date_key:
+                                notifs_by_date.setdefault(date_key, []).append({
+                                    'type': 'notification',
+                                    'id': nid or f"notif-{len(seen_ids)}",
+                                    'unit': item.get('unit', nid),
+                                    'title': item.get('message') or item.get('title', 'Reminder'),
+                                    'time': time_label,
+                                    'target_dt': dt_str
+                                })
+            except Exception as e:
+                print(f"[load_local_notifications error] {e}", file=sys.stderr)
+
+    # Query active systemd user timer units
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "list-timers", "--all", "--no-pager"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for line in proc.stdout.splitlines():
+            if "anubis-reminder-" in line:
+                for part in line.split():
+                    if part.startswith("anubis-reminder-") and part.endswith(".timer"):
+                        unit_base = part[:-6]
+                        if unit_base not in seen_ids:
+                            seen_ids.add(unit_base)
+                            try:
+                                ts = int(unit_base.replace("anubis-reminder-", ""))
+                                dt = datetime.datetime.fromtimestamp(ts)
+                                d_key = dt.date().isoformat()
+                                notifs_by_date.setdefault(d_key, []).append({
+                                    'type': 'notification',
+                                    'id': unit_base,
+                                    'unit': unit_base,
+                                    'title': 'Local Reminder',
+                                    'time': dt.strftime('%I:%M %p'),
+                                    'target_dt': dt.isoformat()
+                                })
+                            except Exception:
+                                pass
+    except Exception as e:
+        print(f"[load_local_notifications systemd timer error] {e}", file=sys.stderr)
+
+    return notifs_by_date
+
+
 def load_events():
+    events = {}
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE) as f:
-                return json.load(f)
+                events = json.load(f)
         except Exception:
-            pass
-    return {}
+            events = {}
+
+    local_notifs = load_local_notifications()
+    for d_key, notif_list in local_notifs.items():
+        events.setdefault(d_key, []).extend(notif_list)
+
+    return events
 
 
 class ClickShield(Gtk.Window):
@@ -427,7 +536,7 @@ class CalendarPopup(Gtk.ApplicationWindow):
 
         # ── Right: day panel ─────────────────────────────────────
         self.right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.right_box.set_size_request(180, -1)
+        self.right_box.set_size_request(210, -1)
         self.right_box.add_css_class('day-panel')
         self.main_box.append(self.right_box)
 
@@ -446,24 +555,67 @@ class CalendarPopup(Gtk.ApplicationWindow):
         self.events_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         scroll.set_child(self.events_box)
 
+        # Quick inline reminder box
+        self.reminder_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.reminder_box.set_visible(False)
+        self.reminder_box.add_css_class('reminder-create-box')
+
+        self.rem_msg_entry = Gtk.Entry()
+        self.rem_msg_entry.set_placeholder_text("Reminder message...")
+        self.rem_msg_entry.add_css_class('reminder-input')
+        self.rem_msg_entry.connect("activate", self._on_save_reminder)
+
+        rem_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.rem_time_entry = Gtk.Entry()
+        self.rem_time_entry.set_placeholder_text("10:00")
+        self.rem_time_entry.set_text("10:00")
+        self.rem_time_entry.set_width_chars(6)
+        self.rem_time_entry.add_css_class('reminder-input')
+        self.rem_time_entry.connect("activate", self._on_save_reminder)
+
+        rem_save_btn = Gtk.Button(label="Save")
+        rem_save_btn.add_css_class('add-btn')
+        rem_save_btn.connect("clicked", self._on_save_reminder)
+
+        rem_cancel_btn = Gtk.Button(label="✕")
+        rem_cancel_btn.add_css_class('notif-delete')
+        rem_cancel_btn.connect("clicked", lambda _: self.reminder_box.set_visible(False))
+
+        rem_row.append(self.rem_time_entry)
+        rem_row.append(rem_save_btn)
+        rem_row.append(rem_cancel_btn)
+
+        self.reminder_box.append(self.rem_msg_entry)
+        self.reminder_box.append(rem_row)
+        self.right_box.append(self.reminder_box)
+
         # Buttons at the bottom
-        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         btn_row.set_size_request(-1, 32)
-        add_btn = Gtk.Button(label="+ Add event")
+        add_btn = Gtk.Button(label="+ Event")
         add_btn.add_css_class('add-btn')
         add_btn.set_hexpand(True)
         add_btn.connect("clicked", self._on_add_clicked)
+
+        rem_btn = Gtk.Button(label="+ Reminder")
+        rem_btn.add_css_class('add-btn')
+        rem_btn.set_hexpand(True)
+        rem_btn.connect("clicked", lambda _: self.reminder_box.set_visible(not self.reminder_box.get_visible()))
+
         edit_btn = Gtk.Button()
         edit_lbl = Gtk.Label(label="\uf044")
         edit_lbl.set_halign(Gtk.Align.CENTER)
         edit_lbl.set_valign(Gtk.Align.CENTER)
         edit_btn.set_child(edit_lbl)
-        edit_btn.set_size_request(36, -1)
+        edit_btn.set_size_request(30, -1)
         edit_btn.set_hexpand(False)
         edit_btn.add_css_class('add-btn')
         edit_btn.add_css_class('nerd')
         edit_btn.connect("clicked", self._on_edit_clicked)
+        edit_btn.set_tooltip_text("Open day in Google Calendar")
+
         btn_row.append(add_btn)
+        btn_row.append(rem_btn)
         btn_row.append(edit_btn)
         self.right_box.append(btn_row)
 
@@ -507,14 +659,21 @@ class CalendarPopup(Gtk.ApplicationWindow):
             overlay.set_child(number)
 
             has_events = any(isinstance(e, str) for e in day_events)
-            has_tasks = any(isinstance(e, dict) and not e.get('done') for e in day_events)
+            has_tasks = any(isinstance(e, dict) and e.get('type') == 'task' and not e.get('done') for e in day_events)
+            has_notifs = any(isinstance(e, dict) and e.get('type') == 'notification' for e in day_events)
 
-            if has_events or has_tasks:
+            if has_events or has_tasks or has_notifs:
                 bar_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
                 bar_box.set_halign(Gtk.Align.CENTER)
                 bar_box.set_valign(Gtk.Align.END)
                 bar_box.set_margin_bottom(4)
-                w = 8 if (has_events and has_tasks) else 18
+                count = sum([has_events, has_tasks, has_notifs])
+                w = 18 if count == 1 else (8 if count == 2 else 5)
+                if has_notifs:
+                    notif_bar = Gtk.Box()
+                    notif_bar.add_css_class('notif-bar')
+                    notif_bar.set_size_request(w, 2)
+                    bar_box.append(notif_bar)
                 if has_tasks:
                     task_bar = Gtk.Box()
                     task_bar.add_css_class('task-bar')
@@ -557,11 +716,43 @@ class CalendarPopup(Gtk.ApplicationWindow):
         self.selected_date = btn.date
         self._update_day_panel(btn.date)
 
-    def _make_event_row(self, ev):
-        """Build a single event or task row for the day panel."""
+    def _make_event_row(self, ev, show_date=False):
+        """Build a single event, task, or notification row for the day panel."""
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
 
         if isinstance(ev, dict):
+            if ev.get('type') == 'notification':
+                bell = Gtk.Label(label="\uf0f3")
+                bell.add_css_class('notif-bell')
+                bell.add_css_class('nerd')
+
+                date_prefix = ""
+                if show_date and ev.get('target_dt'):
+                    try:
+                        dt = datetime.datetime.fromisoformat(ev['target_dt'])
+                        date_prefix = f"<span alpha='65%'>{dt.strftime('%a %d %b')}</span>  "
+                    except Exception:
+                        pass
+
+                t_str = f"<b>{ev.get('time', '')}</b> " if ev.get('time') else ""
+                name = Gtk.Label()
+                name.set_markup(f"{date_prefix}{t_str}{ev['title']}")
+                name.set_hexpand(True)
+                name.set_halign(Gtk.Align.START)
+                name.set_ellipsize(Pango.EllipsizeMode.END)
+                name.set_tooltip_text(ev['title'])
+                name.add_css_class('event-name')
+
+                del_btn = Gtk.Button(label="✕")
+                del_btn.add_css_class('notif-delete')
+                del_btn.set_tooltip_text("Dismiss reminder")
+                del_btn.connect("clicked", self._on_notification_delete, ev)
+
+                row.append(bell)
+                row.append(name)
+                row.append(del_btn)
+                return row
+
             # Task row: colored dot, title, done toggle button
             done = ev.get('done', False)
             dot = Gtk.Label(label="•")
@@ -606,30 +797,91 @@ class CalendarPopup(Gtk.ApplicationWindow):
                 break
             self.events_box.remove(child)
 
-        # Sort order: undone tasks (0) → done tasks (1) → events (2)
-        day_events = sorted(
-            self.events.get(date.isoformat(), []),
-            key=lambda e: 0 if (isinstance(e, dict) and not e.get('done')) else (1 if isinstance(e, dict) else 2)
-        )
-        if day_events:
-            for ev in day_events:
+        day_items = self.events.get(date.isoformat(), [])
+        notifs = [e for e in day_items if isinstance(e, dict) and e.get('type') == 'notification']
+        tasks = [e for e in day_items if isinstance(e, dict) and e.get('type') == 'task']
+        cal_events = [e for e in day_items if isinstance(e, str)]
+
+        has_any = False
+
+        if notifs:
+            has_any = True
+            sec = Gtk.Label(label="LOCAL REMINDERS")
+            sec.add_css_class('section-title')
+            sec.set_halign(Gtk.Align.START)
+            self.events_box.append(sec)
+            for n in notifs:
+                self.events_box.append(self._make_event_row(n))
+
+        if tasks:
+            has_any = True
+            sec = Gtk.Label(label="TASKS")
+            sec.add_css_class('section-title')
+            sec.set_halign(Gtk.Align.START)
+            self.events_box.append(sec)
+            for t in sorted(tasks, key=lambda x: 1 if x.get('done') else 0):
+                self.events_box.append(self._make_event_row(t))
+
+        if cal_events:
+            has_any = True
+            sec = Gtk.Label(label="EVENTS")
+            sec.add_css_class('section-title')
+            sec.set_halign(Gtk.Align.START)
+            self.events_box.append(sec)
+            for ev in cal_events:
                 self.events_box.append(self._make_event_row(ev))
-        else:
-            empty = Gtk.Label(label="No events")
+
+        # Show upcoming local reminders across future dates when viewing today or if no local reminders today
+        upcoming_notifs = []
+        for d_key in sorted(self.events.keys()):
+            if d_key >= self.today.isoformat():
+                for item in self.events.get(d_key, []):
+                    if isinstance(item, dict) and item.get('type') == 'notification':
+                        if d_key != date.isoformat():
+                            upcoming_notifs.append(item)
+
+        if upcoming_notifs and (date == self.today or not notifs):
+            has_any = True
+            sec = Gtk.Label(label="UPCOMING REMINDERS")
+            sec.add_css_class('section-title')
+            sec.set_halign(Gtk.Align.START)
+            self.events_box.append(sec)
+            for n in upcoming_notifs:
+                self.events_box.append(self._make_event_row(n, show_date=True))
+
+        if not has_any:
+            empty = Gtk.Label(label="No events or reminders")
             empty.add_css_class('no-events')
             empty.set_halign(Gtk.Align.START)
             self.events_box.append(empty)
 
+    def _get_calendar_url(self, path, query=""):
+        email = None
+        if os.path.exists(ACCOUNT_FILE):
+            try:
+                with open(ACCOUNT_FILE) as f:
+                    email = f.read().strip()
+            except Exception:
+                pass
+        url = f"https://calendar.google.com/calendar/r/{path}"
+        params = []
+        if query:
+            params.append(query)
+        if email:
+            params.append(f"authuser={email}")
+        if params:
+            url += "?" + "&".join(params)
+        return url
+
     def _on_add_clicked(self, _):
         d = self.selected_date
-        url = (f"https://calendar.google.com/calendar/r/eventedit"
-               f"?dates={d.strftime('%Y%m%d')}/{d.strftime('%Y%m%d')}")
+        url = self._get_calendar_url("eventedit", f"dates={d.strftime('%Y%m%d')}/{d.strftime('%Y%m%d')}")
         subprocess.Popen(['xdg-open', url])
         self._hide()
 
     def _on_edit_clicked(self, _):
         d = self.selected_date
-        url = f"https://calendar.google.com/calendar/r/day/{d.year}/{d.month}/{d.day}"
+        url = self._get_calendar_url(f"day/{d.year}/{d.month}/{d.day}")
         subprocess.Popen(['xdg-open', url])
         self._hide()
 
@@ -664,6 +916,99 @@ class CalendarPopup(Gtk.ApplicationWindow):
                     return False
                 GLib.idle_add(after_err)
         threading.Thread(target=do_toggle, daemon=True).start()
+
+    def _on_save_reminder(self, _):
+        msg = self.rem_msg_entry.get_text().strip()
+        t_str = self.rem_time_entry.get_text().strip() or "10:00"
+        if not msg:
+            return
+        d_str = self.selected_date.isoformat()
+
+        try:
+            anubis_path = os.path.expanduser('~/Downloads/Anubis')
+            if anubis_path not in sys.path:
+                sys.path.insert(0, anubis_path)
+            from actions.reminder import reminder as anubis_reminder
+            anubis_reminder({"action": "set_reminder", "message": msg, "date": d_str, "time": t_str})
+        except Exception as e:
+            try:
+                target_dt = datetime.datetime.fromisoformat(f"{d_str}T{t_str}:00")
+                unit_name = f"anubis-reminder-{int(target_dt.timestamp())}"
+                safe_msg = msg.replace('"', '\\"').replace("'", "'\\''")
+                notify_cmd = (
+                    f'paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null; '
+                    f'gdbus call --session --dest org.freedesktop.Notifications '
+                    f'--object-path /org/freedesktop/Notifications '
+                    f'--method org.freedesktop.Notifications.Notify '
+                    f'"Anubis" 0 "" "Anubis Reminder" "{safe_msg}" "[]" "{{}}" 15000'
+                )
+                subprocess.run([
+                    "systemd-run", "--user", f"--unit={unit_name}",
+                    f"--on-calendar={target_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+                    "sh", "-c", notify_cmd
+                ], check=False)
+                os.makedirs(os.path.dirname(NOTIFICATIONS_FILE), exist_ok=True)
+                items = []
+                if os.path.exists(NOTIFICATIONS_FILE):
+                    try:
+                        with open(NOTIFICATIONS_FILE, 'r') as f:
+                            items = json.load(f)
+                    except Exception:
+                        items = []
+                items.append({
+                    "id": unit_name,
+                    "unit": unit_name,
+                    "message": msg,
+                    "target_dt": target_dt.isoformat()
+                })
+                with open(NOTIFICATIONS_FILE, 'w') as f:
+                    json.dump(items, f, indent=2)
+            except Exception as ex:
+                print(f"[Save Reminder Error] {ex}", file=sys.stderr)
+
+        self.rem_msg_entry.set_text("")
+        self.reminder_box.set_visible(False)
+        self.events = load_events()
+        self._build_grid()
+        self._update_day_panel(self.selected_date)
+
+    def _on_notification_delete(self, btn, notif):
+        btn.set_sensitive(False)
+        unit = notif.get('unit')
+        if unit:
+            timer_unit = f"{unit}.timer" if not unit.endswith(".timer") else unit
+            subprocess.run(["systemctl", "--user", "stop", timer_unit], check=False)
+
+        # Remove from local notification sources
+        sources = [NOTIFICATIONS_FILE, ANUBIS_NOTIFICATIONS_FILE]
+        nid = notif.get('id') or unit
+        for s_path in sources:
+            if os.path.exists(s_path):
+                try:
+                    with open(s_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    if isinstance(data, list):
+                        new_data = [item for item in data if (item.get('id') or item.get('unit')) != nid]
+                        with open(s_path, 'w', encoding='utf-8') as f:
+                            json.dump(new_data, f, indent=2)
+                except Exception:
+                    pass
+
+        # Also clean up in Google Calendar if synced
+        try:
+            anubis_path = os.path.expanduser('~/Downloads/Anubis')
+            if anubis_path not in sys.path:
+                sys.path.insert(0, anubis_path)
+            from actions.reminder import _delete_calendar_events
+            title = notif.get('title', '')
+            if title and title != "Local Reminder":
+                _delete_calendar_events(title, reminders_only=True)
+        except Exception:
+            pass
+
+        self.events = load_events()
+        self._build_grid()
+        self._update_day_panel(self.selected_date)
 
     def _draw_refresh_icon(self, da, ctx, width, height):
         """Cairo draw callback. Renders the Nerd Font refresh glyph, rotated when spinning.
@@ -835,6 +1180,53 @@ class CalendarPopup(Gtk.ApplicationWindow):
       .event-name {{
           font-size: 11px;
           color: {fg};
+      }}
+      .notif-bar {{
+          background: #f1fa8c;
+          border-radius: 2px;
+          min-height: 2px;
+      }}
+      .notif-bell {{
+          color: #f1fa8c;
+          font-family: "{NERD_FONT}";
+          font-size: 11px;
+      }}
+      .section-title {{
+          font-size: 9px;
+          font-weight: bold;
+          letter-spacing: 0.5px;
+          color: {hex_to_rgba(fg, 0.45)};
+          margin-top: 6px;
+          margin-bottom: 2px;
+      }}
+      .reminder-create-box {{
+          background: rgba(255, 255, 255, 0.05);
+          border: 1px solid {hex_to_rgba(accent, 0.2)};
+          border-radius: 6px;
+          padding: 6px;
+          margin-top: 4px;
+          margin-bottom: 4px;
+      }}
+      .reminder-input {{
+          font-size: 11px;
+          min-height: 22px;
+          padding: 2px 6px;
+          border-radius: 4px;
+          border: 1px solid {hex_to_rgba(fg, 0.15)};
+          background: rgba(0, 0, 0, 0.2);
+          color: {fg};
+      }}
+      .notif-delete {{
+          font-size: 10px;
+          min-width: 16px;
+          min-height: 16px;
+          padding: 0;
+          border: none;
+          background: transparent;
+          color: {hex_to_rgba(fg, 0.35)};
+      }}
+      .notif-delete:hover {{
+          color: #ff5555;
       }}
       .task-bar {{
           background: {hex_to_rgba(red, 0.9)};

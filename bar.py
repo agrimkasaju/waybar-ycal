@@ -20,8 +20,8 @@ events = load_events()
 today_events = events.get(today.isoformat(), [])
 
 output = {
-    "text": f"\U000f00ed  {now.strftime('%A %H:%M')}",
-    "tooltip": "",
+    "text": f"\U000f00ed  {now.strftime('%A %I:%M %p')}",
+    "tooltip": now.strftime("%A, %B %d, %Y"),
     "class": "has-events" if today_events else ""
 }
 
