@@ -34,7 +34,9 @@ import threading
 import tomllib
 
 CACHE_FILE = os.path.expanduser('~/.cache/waybar-ycal/events.json')
-ACCOUNT_FILE = os.path.expanduser('~/.cache/waybar-ycal/account.txt')
+CONFIG_ACCOUNT_FILE = os.path.expanduser('~/.config/waybar-ycal/account.txt')
+CACHE_ACCOUNT_FILE = os.path.expanduser('~/.cache/waybar-ycal/account.txt')
+ACCOUNT_FILE = CONFIG_ACCOUNT_FILE
 PID_FILE = os.path.expanduser('~/.cache/waybar-ycal/popup.pid')
 THEME_FILE = os.path.expanduser('~/.config/omarchy/current/theme/colors.toml')
 CREDENTIALS_FILE = os.path.expanduser('~/.config/waybar-ycal/credentials.json')
@@ -67,6 +69,20 @@ def resolve_token_file():
                 except Exception:
                     pass
             return CONFIG_TOKEN_FILE
+    return None
+
+
+def resolve_account_email():
+    """Find the linked Google account email, checking persistent config then cache."""
+    for a_path in [CONFIG_ACCOUNT_FILE, CACHE_ACCOUNT_FILE]:
+        if os.path.exists(a_path):
+            try:
+                with open(a_path) as f:
+                    val = f.read().strip()
+                    if val and '@' in val:
+                        return val
+            except Exception:
+                pass
     return None
 
 
@@ -127,15 +143,12 @@ def _run_sync():
 
         # Fetch from all calendars (fallback to primary if calendarList is restricted by scopes)
         calendar_ids = []
+        user_account = resolve_account_email()
         try:
             cal_list = service.calendarList().list().execute()
             for c in cal_list.get('items', []):
                 if c.get('primary'):
-                    try:
-                        with open(ACCOUNT_FILE, 'w') as f:
-                            f.write(c.get('id', ''))
-                    except Exception:
-                        pass
+                    user_account = c.get('id', '')
                     break
             calendar_ids = [c['id'] for c in cal_list.get('items', [])]
         except Exception:
@@ -155,6 +168,12 @@ def _run_sync():
             except Exception:
                 continue
             for item in result.get('items', []):
+                if not user_account:
+                    for field in ['creator', 'organizer']:
+                        info = item.get(field, {})
+                        if info.get('self') and info.get('email'):
+                            user_account = info.get('email')
+                            break
                 start = item['start']
                 end = item['end']
                 title = item.get('summary', '(no title)')
@@ -171,6 +190,15 @@ def _run_sync():
                     while d < d_end:
                         events_by_date.setdefault(d.isoformat(), []).append(title)
                         d += datetime.timedelta(days=1)
+
+        if user_account:
+            for a_path in [CONFIG_ACCOUNT_FILE, CACHE_ACCOUNT_FILE]:
+                try:
+                    os.makedirs(os.path.dirname(a_path), exist_ok=True)
+                    with open(a_path, 'w') as f:
+                        f.write(user_account.strip())
+                except Exception:
+                    pass
 
         # Fetch Google Tasks with due dates
         tasks_service = build('tasks', 'v1', credentials=creds)
@@ -824,6 +852,12 @@ class CalendarPopup(Gtk.ApplicationWindow):
             row.append(dot)
             row.append(name)
 
+            # Make event row clickable to open day in Google Calendar with authuser
+            row.add_css_class('clickable-event')
+            click = Gtk.GestureClick()
+            click.connect("pressed", lambda *_: self._on_edit_clicked(None))
+            row.add_controller(click)
+
         return row
 
     def _update_day_panel(self, date):
@@ -900,13 +934,7 @@ class CalendarPopup(Gtk.ApplicationWindow):
             self.events_box.append(empty)
 
     def _get_calendar_url(self, path, query=""):
-        email = None
-        if os.path.exists(ACCOUNT_FILE):
-            try:
-                with open(ACCOUNT_FILE) as f:
-                    email = f.read().strip()
-            except Exception:
-                pass
+        email = resolve_account_email()
         url = f"https://calendar.google.com/calendar/r/{path}"
         params = []
         if query:
@@ -1224,6 +1252,13 @@ class CalendarPopup(Gtk.ApplicationWindow):
       .event-name {{
           font-size: 11px;
           color: {fg};
+      }}
+      .clickable-event {{
+          border-radius: 4px;
+          padding: 2px 4px;
+      }}
+      .clickable-event:hover {{
+          background: rgba(255, 255, 255, 0.08);
       }}
       .notif-bar {{
           background: #f1fa8c;

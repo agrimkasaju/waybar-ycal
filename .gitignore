@@ -5,3 +5,5 @@ pyrightconfig.json
 credentials.json
 *.token.json
 token.json
+account.txt
+
