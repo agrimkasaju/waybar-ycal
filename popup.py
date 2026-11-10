@@ -38,7 +38,10 @@ ACCOUNT_FILE = os.path.expanduser('~/.cache/waybar-ycal/account.txt')
 PID_FILE = os.path.expanduser('~/.cache/waybar-ycal/popup.pid')
 THEME_FILE = os.path.expanduser('~/.config/omarchy/current/theme/colors.toml')
 CREDENTIALS_FILE = os.path.expanduser('~/.config/waybar-ycal/credentials.json')
-TOKEN_FILE = os.path.expanduser('~/.cache/waybar-ycal/token.json')
+CONFIG_TOKEN_FILE = os.path.expanduser('~/.config/waybar-ycal/token.json')
+CACHE_TOKEN_FILE = os.path.expanduser('~/.cache/waybar-ycal/token.json')
+ANUBIS_TOKEN_FILE = os.path.expanduser('~/Downloads/Anubis/config/google_token.json')
+TOKEN_FILE = CONFIG_TOKEN_FILE
 NOTIFICATIONS_FILE = os.path.expanduser('~/.cache/waybar-ycal/notifications.json')
 ANUBIS_NOTIFICATIONS_FILE = os.path.expanduser('~/Downloads/Anubis/config/scheduled_reminders.json')
 SYNC_INTERVAL_SEC = 15 * 60  # 15 minutes
@@ -47,9 +50,24 @@ SYNC_INTERVAL_SEC = 15 * 60  # 15 minutes
 # Change this to match whichever Nerd Font you have installed.
 NERD_FONT = "JetBrainsMonoNL Nerd Font, JetBrainsMono Nerd Font, Symbols Nerd Font"
 SCOPES = [
-    'https://www.googleapis.com/auth/calendar.readonly',
+    'https://www.googleapis.com/auth/calendar.events',
     'https://www.googleapis.com/auth/tasks',
 ]
+
+
+def resolve_token_file():
+    """Find a valid token file, prioritizing config dir over cache or external fallback."""
+    for path in [CONFIG_TOKEN_FILE, CACHE_TOKEN_FILE, ANUBIS_TOKEN_FILE]:
+        if os.path.exists(path):
+            if path != CONFIG_TOKEN_FILE:
+                try:
+                    import shutil
+                    os.makedirs(os.path.dirname(CONFIG_TOKEN_FILE), exist_ok=True)
+                    shutil.copy2(path, CONFIG_TOKEN_FILE)
+                except Exception:
+                    pass
+            return CONFIG_TOKEN_FILE
+    return None
 
 
 def _get_credentials():
@@ -57,20 +75,35 @@ def _get_credentials():
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
 
+    token_file = resolve_token_file()
     creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if token_file and os.path.exists(token_file):
+        try:
+            creds = Credentials.from_authorized_user_file(token_file)
+        except Exception:
+            creds = None
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                print(f"[gcal token refresh error] {e}", file=sys.stderr)
+                creds = None
         else:
             if not os.path.exists(CREDENTIALS_FILE):
                 return None
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
-        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
-        with open(TOKEN_FILE, 'w') as f:
-            f.write(creds.to_json())
+        if creds and creds.valid:
+            os.makedirs(os.path.dirname(CONFIG_TOKEN_FILE), exist_ok=True)
+            with open(CONFIG_TOKEN_FILE, 'w') as f:
+                f.write(creds.to_json())
+            try:
+                os.makedirs(os.path.dirname(CACHE_TOKEN_FILE), exist_ok=True)
+                with open(CACHE_TOKEN_FILE, 'w') as f:
+                    f.write(creds.to_json())
+            except Exception:
+                pass
     return creds
 
 
@@ -80,7 +113,7 @@ def _run_sync():
         from googleapiclient.discovery import build
 
         # Don't attempt sync if not authenticated — avoids opening browser on startup
-        if not os.path.exists(TOKEN_FILE):
+        if not resolve_token_file():
             return
 
         creds = _get_credentials()
@@ -92,17 +125,21 @@ def _run_sync():
         time_min = (today - datetime.timedelta(days=60)).isoformat() + 'T00:00:00Z'
         time_max = (today + datetime.timedelta(days=365)).isoformat() + 'T23:59:59Z'
 
-        # Fetch from all calendars
-        cal_list = service.calendarList().list().execute()
-        for c in cal_list.get('items', []):
-            if c.get('primary'):
-                try:
-                    with open(ACCOUNT_FILE, 'w') as f:
-                        f.write(c.get('id', ''))
-                except Exception:
-                    pass
-                break
-        calendar_ids = [c['id'] for c in cal_list.get('items', [])]
+        # Fetch from all calendars (fallback to primary if calendarList is restricted by scopes)
+        calendar_ids = []
+        try:
+            cal_list = service.calendarList().list().execute()
+            for c in cal_list.get('items', []):
+                if c.get('primary'):
+                    try:
+                        with open(ACCOUNT_FILE, 'w') as f:
+                            f.write(c.get('id', ''))
+                    except Exception:
+                        pass
+                    break
+            calendar_ids = [c['id'] for c in cal_list.get('items', [])]
+        except Exception:
+            calendar_ids = ['primary']
 
         events_by_date = {}
         for cal_id in calendar_ids:
@@ -351,6 +388,13 @@ class CalendarPopup(Gtk.ApplicationWindow):
         self.set_visible(False)
 
     def toggle(self):
+        if not os.path.exists(PID_FILE):
+            try:
+                os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+                with open(PID_FILE, 'w') as f:
+                    f.write(str(os.getpid()))
+            except Exception:
+                pass
         if self.get_visible():
             self._hide()
         else:
@@ -363,7 +407,7 @@ class CalendarPopup(Gtk.ApplicationWindow):
             self._show_setup_screen('no_credentials')
             self.present()
             return
-        if not os.path.exists(TOKEN_FILE):
+        if not resolve_token_file():
             self._show_setup_screen('no_token')
             self.present()
             return
